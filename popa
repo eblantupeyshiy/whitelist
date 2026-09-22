@@ -318,7 +318,24 @@ local function luau_deserialize(bytecode, luau_settings)
 			return str
 		end
 	end
+		local function readVarInt64()
+		local result = 0
+		local multiplier = 1
 
+		for _ = 1, 10 do
+			local value = readByte()
+
+			result += bit32_band(value, 0x7F) * multiplier
+
+			if not bit32_btest(value, 0x80) then
+				return result
+			end
+
+			multiplier *= 128
+		end
+
+		error("invalid 64-bit varint", 0)
+	end
 	local luauVersion = readByte()
 	local typesVersion = 0
 	if luauVersion == 0 then
@@ -384,15 +401,26 @@ local function luau_deserialize(bytecode, luau_settings)
 		return usesAux
 	end
 
-	local function checkkmode(inst, k)
+			local function checkkmode(inst, k)
 		local kmode = inst.kmode
 
 		if kmode == 1 then --// AUX
-			inst.K = k[inst.aux +  1]
+			local index = inst.aux
+
+			-- GETUDATAKS / SETUDATAKS / NAMECALLUDATA
+			-- use only the low 16 bits of AUX for the constant index.
+			if inst.opcode == 83 or inst.opcode == 84 or inst.opcode == 85 then
+				index = bit32_band(index, 0xFFFF)
+			end
+
+			inst.K = k[index + 1]
+
 		elseif kmode == 2 then --// C
 			inst.K = k[inst.C + 1]
-		elseif kmode == 3 then--// D
+
+		elseif kmode == 3 then --// D
 			inst.K = k[inst.D + 1]
+
 		elseif kmode == 4 then --// AUX import
 			local extend = inst.aux
 			local count = bit32_rshift(extend, 30)
@@ -400,37 +428,398 @@ local function luau_deserialize(bytecode, luau_settings)
 
 			inst.K0 = k[id0 + 1]
 			inst.KC = count
+
 			if count == 2 then
 				local id1 = bit32_band(bit32_rshift(extend, 10), 0x3FF)
-
 				inst.K1 = k[id1 + 1]
+
 			elseif count == 3 then
 				local id1 = bit32_band(bit32_rshift(extend, 10), 0x3FF)
-				local id2 = bit32_band(bit32_rshift(extend, 0), 0x3FF)
+				local id2 = bit32_band(extend, 0x3FF)
 
 				inst.K1 = k[id1 + 1]
 				inst.K2 = k[id2 + 1]
 			end
+
 			if luau_settings.useImportConstants then
 				inst.K = resolveImportConstant(
 					luau_settings.staticEnvironment,
-					count, inst.K0, inst.K1, inst.K2
+					count,
+					inst.K0,
+					inst.K1,
+					inst.K2
 				)
 			end
+
 		elseif kmode == 5 then --// AUX boolean low 1 bit
 			inst.K = bit32_extract(inst.aux, 0, 1) == 1
 			inst.KN = bit32_extract(inst.aux, 31, 1) == 1
+
 		elseif kmode == 6 then --// AUX number low 24 bits
 			inst.K = k[bit32_extract(inst.aux, 0, 24) + 1]
 			inst.KN = bit32_extract(inst.aux, 31, 1) == 1
+
 		elseif kmode == 7 then --// B
 			inst.K = k[inst.B + 1]
+
 		elseif kmode == 8 then --// AUX number low 16 bits
-			inst.K = bit32_band(inst.aux, 0xf)
+			inst.K = bit32_band(inst.aux, 0xF)
 		end
 	end
 
-	local function readProto(bytecodeid)
+		local function readProto(bytecodeid)
+		local protoSize = nil
+		local protoStart = cursor
+
+		-- v12+ stores the size of the serialized proto.
+		if luauVersion >= 12 then
+			protoSize = readVarInt()
+			protoStart = cursor
+		end
+
+		local maxstacksize = readByte()
+		local numparams = readByte()
+		local nups = readByte()
+		local isvararg = readByte() ~= 0
+
+		local flags = 0
+
+		if luauVersion >= 4 then
+			flags = readByte()
+
+			local typesize = readVarInt()
+
+			if typesize > 0 then
+				cursor += typesize
+			end
+		end
+
+		-- ---------------------------------------------------------
+		-- Instructions
+		-- ---------------------------------------------------------
+
+		local sizecode = readVarInt()
+		local codelist = table_create(sizecode)
+
+		local skipnext = false
+
+		for i = 1, sizecode do
+			if skipnext then
+				skipnext = false
+				continue
+			end
+
+			skipnext = readInstruction(codelist)
+		end
+
+		local debugcodelist = table_create(sizecode)
+
+		for i = 1, sizecode do
+			debugcodelist[i] = codelist[i].opcode
+		end
+
+		-- ---------------------------------------------------------
+		-- Constants
+		-- ---------------------------------------------------------
+
+		local sizek = readVarInt()
+		local klist = table_create(sizek)
+
+		for i = 1, sizek do
+			local kt = readByte()
+			local k
+
+			if kt == 0 then
+				-- Nil
+
+			elseif kt == 1 then
+				-- Bool
+				k = readByte() ~= 0
+
+			elseif kt == 2 then
+				-- Number
+				k = readDouble()
+
+			elseif kt == 3 then
+				-- String
+				k = stringList[readVarInt()]
+
+			elseif kt == 4 then
+				-- Import
+				k = readWord()
+
+			elseif kt == 5 then
+				-- Table
+				local dataLength = readVarInt()
+
+				k = table_create(dataLength)
+
+				for j = 1, dataLength do
+					k[j] = readVarInt()
+				end
+
+			elseif kt == 6 then
+				-- Closure
+				k = readVarInt()
+
+			elseif kt == 7 then
+				-- Vector<float>
+				local x = readFloat()
+				local y = readFloat()
+				local z = readFloat()
+				local w = readFloat()
+
+				if luau_settings.vectorSize == 4 then
+					k = luau_settings.vectorCtor(x, y, z, w)
+				else
+					k = luau_settings.vectorCtor(x, y, z)
+				end
+
+			elseif kt == 8 then
+				-- TABLE_WITH_CONSTANTS
+				local dataLength = readVarInt()
+
+				k = table_create(dataLength)
+
+				for j = 1, dataLength do
+					local key = readVarInt()
+					local constantIndex = readWord()
+
+					k[j] = {
+						key = key,
+						constant = constantIndex,
+					}
+				end
+
+			elseif kt == 9 then
+				-- INTEGER
+				local negative = readByte() ~= 0
+				local value = readVarInt64()
+
+				if negative then
+					k = -value
+				else
+					k = value
+				end
+
+			elseif kt == 10 then
+				-- CLASS_SHAPE
+				local className = readVarInt()
+				local propertyCount = readVarInt()
+				local methodCount = readVarInt()
+
+				local properties = table_create(propertyCount)
+				local methods = table_create(methodCount)
+
+				for j = 1, propertyCount do
+					properties[j] = readVarInt()
+				end
+
+				for j = 1, methodCount do
+					methods[j] = readVarInt()
+				end
+
+				k = {
+					__classShape = true,
+					className = className,
+					properties = properties,
+					methods = methods,
+				}
+
+			elseif kt == 11 then
+				-- Vector<double>
+				local x = readDouble()
+				local y = readDouble()
+				local z = readDouble()
+				local w = readDouble()
+
+				if luau_settings.vectorSize == 4 then
+					k = luau_settings.vectorCtor(x, y, z, w)
+				else
+					k = luau_settings.vectorCtor(x, y, z)
+				end
+
+			else
+				error(
+					"unsupported constant type: " .. tostring(kt),
+					0
+				)
+			end
+
+			klist[i] = k
+		end
+
+		-- ---------------------------------------------------------
+		-- Resolve constant references in instructions
+		-- ---------------------------------------------------------
+
+		for i = 1, sizecode do
+			checkkmode(codelist[i], klist)
+		end
+
+		-- ---------------------------------------------------------
+		-- Child prototypes
+		-- ---------------------------------------------------------
+
+		local sizep = readVarInt()
+		local protolist = table_create(sizep)
+
+		for i = 1, sizep do
+			protolist[i] = readVarInt() + 1
+		end
+
+		-- ---------------------------------------------------------
+		-- Debug function information
+		-- ---------------------------------------------------------
+
+		local linedefined = readVarInt()
+
+		local debugnameindex = readVarInt()
+		local debugname
+
+		if debugnameindex ~= 0 then
+			debugname = stringList[debugnameindex]
+		else
+			debugname = "(??)"
+		end
+
+		-- ---------------------------------------------------------
+		-- Line info
+		-- ---------------------------------------------------------
+
+		local lineinfoenabled = readByte() ~= 0
+		local instructionlineinfo = nil
+
+		if lineinfoenabled then
+			local linegaplog2 = readByte()
+
+			local intervals = 0
+
+			if sizecode > 0 then
+				intervals =
+					bit32_rshift(sizecode - 1, linegaplog2) + 1
+			end
+
+			local lineinfo = table_create(sizecode)
+			local abslineinfo = table_create(intervals)
+
+			local lastoffset = 0
+
+			for j = 1, sizecode do
+				lastoffset += readByte()
+				lineinfo[j] = lastoffset
+			end
+
+			local lastline = 0
+
+			for j = 1, intervals do
+				lastline += readWord()
+				abslineinfo[j] = lastline % (2 ^ 32)
+			end
+
+			instructionlineinfo = table_create(sizecode)
+
+			for j = 1, sizecode do
+				instructionlineinfo[j] =
+					abslineinfo[
+						bit32_rshift(j - 1, linegaplog2) + 1
+					] + lineinfo[j]
+			end
+		end
+
+		-- ---------------------------------------------------------
+		-- Debug locals / upvalues
+		-- ---------------------------------------------------------
+
+		if readByte() ~= 0 then
+			local sizel = readVarInt()
+
+			for i = 1, sizel do
+				readVarInt() -- name
+				readVarInt() -- start pc
+				readVarInt() -- end pc
+				readByte()   -- register
+			end
+
+			local sizeupvalues = readVarInt()
+
+			for i = 1, sizeupvalues do
+				readVarInt()
+			end
+		end
+
+		-- ---------------------------------------------------------
+		-- v11+ feedback vector
+		-- ---------------------------------------------------------
+
+		if luauVersion >= 11 then
+			local feedbackCount = readVarInt()
+
+			for i = 1, feedbackCount do
+				readByte()   -- feedback type
+				readVarInt() -- instruction pc
+			end
+		end
+
+		-- ---------------------------------------------------------
+		-- v12+ cost model
+		--
+		-- Current Luau writes this only when LPF_INLINABLE is set.
+		-- ---------------------------------------------------------
+
+		if luauVersion >= 12 then
+			local LPF_INLINABLE = 0x08
+
+			if bit32_band(flags, LPF_INLINABLE) ~= 0 then
+				readVarInt64()
+			end
+		end
+
+		-- ---------------------------------------------------------
+		-- Validate proto boundary
+		-- ---------------------------------------------------------
+
+		if protoSize ~= nil then
+			local expectedEnd = protoStart + protoSize
+
+			if cursor ~= expectedEnd then
+				error(
+					"proto size mismatch: "
+						.. tostring(cursor - protoStart)
+						.. "/"
+						.. tostring(protoSize),
+					0
+				)
+			end
+		end
+
+		return {
+			maxstacksize = maxstacksize;
+			numparams = numparams;
+			nups = nups;
+			isvararg = isvararg;
+
+			flags = flags;
+
+			linedefined = linedefined;
+			debugname = debugname;
+
+			sizecode = sizecode;
+			code = codelist;
+			debugcode = debugcodelist;
+
+			sizek = sizek;
+			k = klist;
+
+			sizep = sizep;
+			protos = protolist;
+
+			lineinfoenabled = lineinfoenabled;
+			instructionlineinfo = instructionlineinfo;
+
+			bytecodeid = bytecodeid;
+		}
+	end
     if luauVersion >= 12 then
         readVarInt() -- размер proto в байтах
     end
@@ -642,7 +1031,7 @@ local function luau_load(module, env, luau_settings)
 	if type(module) ~= "table" then
 		module = luau_deserialize(module, luau_settings)
 	end
-
+	
 	local protolist = module.protoList
 	local mainProto = module.mainProto
 
@@ -652,6 +1041,9 @@ local function luau_load(module, env, luau_settings)
 	local panicHook = luau_settings.callHooks.panicHook
 
 	local alive = true 
+		local closureProto = setmetatable({}, {
+		__mode = "k"
+	})
 
 	local function luau_close()
 		alive = false
@@ -1320,14 +1712,115 @@ local function luau_load(module, env, luau_settings)
 					else
 						pc += 1
 					end
-				elseif op == 81 then --[[ IDIV ]]
+								elseif op == 81 then --[[ IDIV ]]
 					stack[inst.A] = stack[inst.B] // stack[inst.C]
+
 				elseif op == 82 then --[[ IDIVK ]]
 					stack[inst.A] = stack[inst.B] // inst.K
+
+				elseif op == 83 then --[[ GETUDATAKS ]]
+					stack[inst.A] = stack[inst.B][inst.K]
+					pc += 1 -- AUX
+
+				elseif op == 84 then --[[ SETUDATAKS ]]
+					stack[inst.B][inst.K] = stack[inst.A]
+					pc += 1 -- AUX
+
+				elseif op == 85 then --[[ NAMECALLUDATA ]]
+					local A = inst.A
+					local B = inst.B
+					local kv = inst.K
+
+					local sb = stack[B]
+
+					stack[A + 1] = sb
+
+					pc += 1 -- AUX
+
+					stack[A] = sb[kv]
+
+				elseif op == 86 then --[[ NEWCLASSMEMBER ]]
+					error(
+						"NEWCLASSMEMBER is not supported by this VM",
+						0
+					)
+
+				elseif op == 87 then --[[ CALLFB ]]
+					if interruptHook then
+						interruptHook(
+							stack,
+							debugging,
+							proto,
+							module,
+							upvals
+						)
+					end
+
+					local A, B, C = inst.A, inst.B, inst.C
+					local params =
+						if B == 0
+						then top - A
+						else B - 1
+
+					local func = stack[A]
+
+					local ret_list = table_pack(
+						func(
+							table_unpack(
+								stack,
+								A + 1,
+								A + params
+							)
+						)
+					)
+
+					local ret_num = ret_list.n
+
+					if C == 0 then
+						top = A + ret_num - 1
+					else
+						ret_num = C - 1
+					end
+
+					table_move(
+						ret_list,
+						1,
+						ret_num,
+						A,
+						stack
+					)
+
+					pc += 1 -- AUX / feedback slot
+
+				elseif op == 88 then --[[ CMPPROTO ]]
+					local closure = stack[inst.A]
+
+					local protoId = nil
+
+					if closure ~= nil then
+						protoId = closureProto[closure]
+					end
+
+					if protoId ~= inst.aux then
+						pc += inst.D
+					else
+						pc += 1 -- AUX
+					end
+
+				elseif op == 89 then --[[ FASTPCALL ]]
+					-- FASTPCALL is an optimization hint.
+					-- The following CALL still performs the real pcall/xpcall.
+					-- Therefore this VM can safely skip the optimized path.
+					
 				else
-					error("Unsupported Opcode: " .. inst.opname .. " op: " .. op)
+					error(
+						"Unsupported Opcode: "
+							.. inst.opname
+							.. " op: "
+							.. op,
+						0
+					)
 				end
-			end
 
 			for i, uv in open_upvalues do
 				uv.value = uv.store[uv.index]
@@ -1394,14 +1887,17 @@ local function luau_load(module, env, luau_settings)
 			end
 		end
 
-		if luau_settings.errorHandling then 
-			return wrapped
-		else 
-			return luau_execute
-		end 
-	end
+		local result
 
-	return luau_wrapclosure(module, mainProto),  luau_close
+		if luau_settings.errorHandling then
+			result = wrapped
+		else
+			result = luau_execute
+		end
+
+		closureProto[result] = proto.bytecodeid
+
+	return result
 end
 
 return {
