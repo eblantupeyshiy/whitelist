@@ -451,18 +451,25 @@ end
             80,  # JUMPXEQKS
         }
 
+                # ============================================================
+        # STEP 3.5
+        # Luau bytecode parser / opcode permutation
+        # ============================================================
+
         cursor = 0
 
         def ensure(size):
-            if cursor + size > len(bytecode):
+            nonlocal cursor
+
+            if size < 0 or cursor + size > len(bytecode):
                 raise ValueError(
                     "Bytecode повреждён или имеет неизвестный формат."
                 )
 
         def read_u8():
             nonlocal cursor
-            ensure(1)
 
+            ensure(1)
             value = bytecode[cursor]
             cursor += 1
 
@@ -470,6 +477,7 @@ end
 
         def read_u32():
             nonlocal cursor
+
             ensure(4)
 
             value = struct.unpack_from(
@@ -488,22 +496,27 @@ end
             result = 0
             shift = 0
 
-            for _ in range(5):
+            # Luau writeVarInt() is a 7-bit continuation varint.
+            for _ in range(10):
                 value = read_u8()
 
                 result |= (value & 0x7F) << shift
 
-                if not (value & 0x80):
+                if (value & 0x80) == 0:
                     return result
 
                 shift += 7
 
-            raise ValueError("Некорректный varint в bytecode.")
+                if shift >= 64:
+                    break
 
-        
-        # ---------------------------------------------------------
-        # Luau bytecode v3-v14
-        # ---------------------------------------------------------
+            raise ValueError(
+                "Некорректный varint в Luau bytecode."
+            )
+
+        # ------------------------------------------------------------
+        # Bytecode version
+        # ------------------------------------------------------------
 
         luau_version = read_u8()
 
@@ -513,125 +526,202 @@ end
                 f"не поддерживается."
             )
 
+        # ------------------------------------------------------------
+        # Type encoding version
+        # ------------------------------------------------------------
+
         types_version = 0
 
         if luau_version >= 4:
             types_version = read_u8()
 
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
         # String table
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
 
         string_count = read_varint()
 
         for _ in range(string_count):
-            size = read_varint()
-            ensure(size)
-            cursor += size
+            string_size = read_varint()
 
-        # ---------------------------------------------------------
-        # Userdata type remapping
-        # ---------------------------------------------------------
+            ensure(string_size)
+            cursor += string_size
+
+        # ------------------------------------------------------------
+        # Userdata type mapping
+        # ------------------------------------------------------------
 
         if types_version == 3:
             while True:
-                index = read_u8()
+                type_index = read_u8()
 
-                if index == 0:
+                if type_index == 0:
                     break
 
+                # string table index of userdata type name
                 read_varint()
 
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
         # Proto count
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
 
         proto_count = read_varint()
 
-        # ---------------------------------------------------------
-        # Newer Luau versions use additional instructions.
+        # ------------------------------------------------------------
+        # IMPORTANT:
         #
-        # These instructions consume an AUX word after the
-        # instruction itself.
-        # ---------------------------------------------------------
+        # Luau v12+ prefixes every serialized proto with its size.
+        #
+        # That allows us to locate the instruction stream without
+        # having to understand every new constant/debug/cost field.
+        #
+        # This is exactly what we need here because the only thing
+        # Python modifies is the opcode byte.
+        # ------------------------------------------------------------
 
-        aux_opcodes_v14 = {
-            # old AUX opcodes
+        # Current Luau opcode layout:
+        #
+        #  0..26   regular instructions
+        # 27..32   comparison jumps with AUX
+        # 53       NEWTABLE + AUX
+        # 55       SETLIST + AUX
+        # 58       FORGLOOP + AUX
+        # 60       FASTCALL3 + AUX
+        # 66       LOADKX + AUX
+        # 74       FASTCALL2 + AUX
+        # 75       FASTCALL2K + AUX
+        # 77..80   JUMPXEQK* + AUX
+        # 83..85   userdata access + AUX
+        # 86       NEWCLASSMEMBER + AUX
+        # 87       CALLFB + AUX
+        # 88       CMPPROTO + AUX
+        #
+        # FASTPCALL (89) and NEWCLASS (90) do NOT have AUX.
+        #
+        # This follows the current Luau Bytecode.h definitions.
+        # ------------------------------------------------------------
+
+        aux_opcodes = {
             7,    # GETGLOBAL
             8,    # SETGLOBAL
             12,   # GETIMPORT
             15,   # GETTABLEKS
             16,   # SETTABLEKS
-            21,   # NAMECALL
-            32,   # NEWTABLE
-            35,   # SETLIST
-            41,   # FASTCALL3
-            49,   # LOADKX
-            53,   # FASTCALL2
-            54,   # FASTCALL2K
-            63,   # JUMPXEQKNIL
-            64,   # JUMPXEQKB
-            65,   # JUMPXEQKN
-            66,   # JUMPXEQKS
+            20,   # NAMECALL
 
-            # v10+
-            86,   # NEWCLASSMEMBER
+            27,   # JUMPIFEQ
+            28,   # JUMPIFLE
+            29,   # JUMPIFLT
+            30,   # JUMPIFNOTEQ
+            31,   # JUMPIFNOTLE
+            32,   # JUMPIFNOTLT
 
-            # v11+
-            87,   # CALLFB
-            88,   # CMPPROTO
+            53,   # NEWTABLE
+            55,   # SETLIST
+            58,   # FORGLOOP
+            60,   # FASTCALL3
+            66,   # LOADKX
+            74,   # FASTCALL2
+            75,   # FASTCALL2K
 
-            # v9+
+            77,   # JUMPXEQKNIL
+            78,   # JUMPXEQKB
+            79,   # JUMPXEQKN
+            80,   # JUMPXEQKS
+
             83,   # GETUDATAKS
             84,   # SETUDATAKS
             85,   # NAMECALLUDATA
 
-            # v100 / class bytecode
-            90,   # NEWCLASS
+            86,   # NEWCLASSMEMBER
+            87,   # CALLFB
+            88,   # CMPPROTO
         }
 
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
         # Parse every proto
-        # ---------------------------------------------------------
+        # ------------------------------------------------------------
 
-        for _ in range(proto_count):
+        for proto_index in range(proto_count):
 
-            # v12+ stores the serialized size of every proto
+            # --------------------------------------------------------
+            # v12+ has:
+            #
+            #   [varint proto_size]
+            #   [proto bytes...]
+            #
+            # proto_size does NOT include the varint itself.
+            # --------------------------------------------------------
+
             if luau_version >= 12:
                 proto_size = read_varint()
 
+                proto_start = cursor
+                proto_end = proto_start + proto_size
+
+                if proto_end > len(bytecode):
+                    raise ValueError(
+                        f"Proto {proto_index} выходит за границы "
+                        f"bytecode: {proto_end}/{len(bytecode)}"
+                    )
+
+            else:
+                proto_start = cursor
+                proto_end = None
+
+            # --------------------------------------------------------
             # Proto header
+            # --------------------------------------------------------
+
             read_u8()  # maxstacksize
             read_u8()  # numparams
             read_u8()  # nups
             read_u8()  # isvararg
 
-            # v4+
+            # --------------------------------------------------------
+            # v4+ flags + type info
+            # --------------------------------------------------------
+
             if luau_version >= 4:
                 read_u8()  # flags
 
                 types_size = read_varint()
+
                 ensure(types_size)
+
                 cursor += types_size
 
-            # -----------------------------------------------------
-            # Instructions
-            # -----------------------------------------------------
+            # --------------------------------------------------------
+            # Instruction count
+            # --------------------------------------------------------
 
             sizecode = read_varint()
 
-            for _ in range(sizecode):
+            if sizecode > 10_000_000:
+                raise ValueError(
+                    f"Слишком большое количество инструкций "
+                    f"в proto {proto_index}: {sizecode}"
+                )
+
+            # --------------------------------------------------------
+            # Instructions
+            # --------------------------------------------------------
+
+            for instruction_index in range(sizecode):
 
                 instruction_position = cursor
+
                 instruction = read_u32()
 
                 original_opcode = instruction & 0xFF
 
-                # Current Luau has 91 opcodes: 0..90
+                # Current released Luau v14:
+                # 0..90
                 if original_opcode > 90:
                     raise ValueError(
-                        f"Неизвестный opcode {original_opcode}. "
-                        f"Bytecode parser не знает этот opcode."
+                        f"Неизвестный Luau opcode {original_opcode} "
+                        f"(proto={proto_index}, "
+                        f"instruction={instruction_index})."
                     )
 
                 encoded_opcode = opcode_permutation[original_opcode]
@@ -647,192 +737,180 @@ end
                     encoded_instruction
                 )
 
-                # AUX is another 32-bit instruction word.
-                if original_opcode in aux_opcodes_v14:
+                # ----------------------------------------------------
+                # AUX word
+                #
+                # We only need to advance over it.
+                # It must NOT be opcode-permuted.
+                # ----------------------------------------------------
+
+                if original_opcode in aux_opcodes:
                     read_u32()
 
-            # -----------------------------------------------------
-            # Constants
-            # -----------------------------------------------------
-
-            constant_count = read_varint()
-
-            for _ in range(constant_count):
-
-                constant_type = read_u8()
-
-                if constant_type == 0:
-                    # nil
-                    pass
-
-                elif constant_type == 1:
-                    # boolean
-                    read_u8()
-
-                elif constant_type == 2:
-                    # number
-                    ensure(8)
-                    cursor += 8
-
-                elif constant_type == 3:
-                    # string
-                    read_varint()
-
-                elif constant_type == 4:
-                    # import
-                    read_u32()
-
-                elif constant_type == 5:
-                    # table
-                    data_length = read_varint()
-
-                    for _ in range(data_length):
-                        read_varint()
-
-                elif constant_type == 6:
-                    # closure
-                    read_varint()
-
-                elif constant_type == 7:
-                    # Vector<float>
-                    ensure(16)
-                    cursor += 16
-
-                elif constant_type == 8:
-                    # TABLE_WITH_CONSTANTS
-                    data_length = read_varint()
-
-                    for _ in range(data_length):
-                        read_varint()  # key
-                        read_u32()     # constant index
-
-                elif constant_type == 9:
-                    # INTEGER
-                    negative = read_u8()
-                    value = read_varint()
-
-                elif constant_type == 10:
-                    # CLASS_SHAPE
-                    #
-                    # class name
-                    read_varint()
-
-                    # property count
-                    property_count = read_varint()
-
-                    # method count
-                    method_count = read_varint()
-
-                    for _ in range(property_count):
-                        read_varint()
-
-                    for _ in range(method_count):
-                        read_varint()
-
-                elif constant_type == 11:
-                    # Vector<double>
-                    ensure(32)
-                    cursor += 32
-
-                else:
-                    raise ValueError(
-                        f"Неизвестный тип константы {constant_type}."
-                    )
-
-            # -----------------------------------------------------
-            # Child prototypes
-            # -----------------------------------------------------
-
-            prototype_count = read_varint()
-
-            for _ in range(prototype_count):
-                read_varint()
-
-            # -----------------------------------------------------
-            # Debug information
-            # -----------------------------------------------------
-
-            read_varint()  # linedefined
-            read_varint()  # debugnameindex
-
-            # -----------------------------------------------------
-            # Line info
-            # -----------------------------------------------------
-
-            lineinfo_enabled = read_u8() != 0
-
-            if lineinfo_enabled:
-
-                linegaplog2 = read_u8()
-
-                if sizecode == 0:
-                    intervals = 0
-                else:
-                    intervals = (
-                        ((sizecode - 1) >> linegaplog2) + 1
-                    )
-
-                # delta line info
-                ensure(sizecode)
-                cursor += sizecode
-
-                # absolute line info
-                ensure(intervals * 4)
-                cursor += intervals * 4
-
-            # -----------------------------------------------------
-            # Debug locals/upvalues
-            # -----------------------------------------------------
-
-            debuginfo_enabled = read_u8() != 0
-
-            if debuginfo_enabled:
-
-                local_count = read_varint()
-
-                for _ in range(local_count):
-                    read_varint()  # name
-                    read_varint()  # startpc
-                    read_varint()  # endpc
-                    read_u8()      # register
-
-                upvalue_count = read_varint()
-
-                for _ in range(upvalue_count):
-                    read_varint()
-
-            # -----------------------------------------------------
-            # v11+ feedback vector
-            # -----------------------------------------------------
+            # --------------------------------------------------------
+            # v12+:
             #
-            # CALLFB/CMPPROTO use feedback slots.
-            # The vector description is serialized after debug info.
+            # We have already found and transformed every instruction.
             #
-            # We only need to preserve/skip it here; the actual VM
-            # will handle the feedback data.
-            # -----------------------------------------------------
-
-            if luau_version >= 11:
-                feedback_count = read_varint()
-
-                for _ in range(feedback_count):
-                    read_varint()
-
-            # -----------------------------------------------------
-            # v12+ cost function
-            # -----------------------------------------------------
+            # Everything after the instruction stream belongs to the
+            # serialized proto: constants, child proto ids, debug
+            # information, feedback information, cost information, etc.
+            #
+            # We deliberately do not parse those fields here.
+            # proto_size gives us the exact boundary.
+            # --------------------------------------------------------
 
             if luau_version >= 12:
-                cost_size = read_varint()
 
-                ensure(cost_size)
-                cursor += cost_size
+                if cursor > proto_end:
+                    raise ValueError(
+                        f"Proto {proto_index} повреждён: "
+                        f"cursor={cursor}, end={proto_end}"
+                    )
 
-        # ---------------------------------------------------------
-        # Main proto
-        # ---------------------------------------------------------
+                # Skip all fields after the code.
+                cursor = proto_end
 
-        read_varint()  # main proto id
+            else:
+                # ----------------------------------------------------
+                # Legacy v3-v11 parser.
+                #
+                # Current compiler produces v14, so this branch is
+                # only for old bytecode compatibility.
+                # ----------------------------------------------------
+
+                constant_count = read_varint()
+
+                for _ in range(constant_count):
+
+                    constant_type = read_u8()
+
+                    if constant_type == 0:
+                        # nil
+                        pass
+
+                    elif constant_type == 1:
+                        # boolean
+                        read_u8()
+
+                    elif constant_type == 2:
+                        # number
+                        ensure(8)
+                        cursor += 8
+
+                    elif constant_type == 3:
+                        # string
+                        read_varint()
+
+                    elif constant_type == 4:
+                        # import
+                        read_u32()
+
+                    elif constant_type == 5:
+                        # table
+                        data_length = read_varint()
+
+                        for _ in range(data_length):
+                            read_varint()
+
+                    elif constant_type == 6:
+                        # closure
+                        read_varint()
+
+                    elif constant_type == 7:
+                        # vector<float>
+                        ensure(16)
+                        cursor += 16
+
+                    elif constant_type == 8:
+                        # table with constants
+                        data_length = read_varint()
+
+                        for _ in range(data_length):
+                            read_varint()
+                            read_u32()
+
+                    elif constant_type == 9:
+                        # 64-bit integer
+                        read_u8()       # sign
+                        read_varint()   # magnitude
+
+                    else:
+                        raise ValueError(
+                            f"Неизвестный тип константы "
+                            f"{constant_type}."
+                        )
+
+                # child prototypes
+                prototype_count = read_varint()
+
+                for _ in range(prototype_count):
+                    read_varint()
+
+                # debug function information
+                read_varint()  # linedefined
+                read_varint()  # debugnameindex
+
+                # line information
+                lineinfo_enabled = read_u8() != 0
+
+                if lineinfo_enabled:
+
+                    linegaplog2 = read_u8()
+
+                    if sizecode == 0:
+                        intervals = 0
+                    else:
+                        intervals = (
+                            ((sizecode - 1) >> linegaplog2) + 1
+                        )
+
+                    ensure(sizecode)
+                    cursor += sizecode
+
+                    ensure(intervals * 4)
+                    cursor += intervals * 4
+
+                # debug locals/upvalues
+                debuginfo_enabled = read_u8() != 0
+
+                if debuginfo_enabled:
+
+                    local_count = read_varint()
+
+                    for _ in range(local_count):
+                        read_varint()  # name
+                        read_varint()  # startpc
+                        read_varint()  # endpc
+                        read_u8()      # register
+
+                    upvalue_count = read_varint()
+
+                    for _ in range(upvalue_count):
+                        read_varint()
+
+                    # Older feedback-vector format
+                    if luau_version >= 11:
+                        feedback_count = read_varint()
+
+                        for _ in range(feedback_count):
+                            read_u8()
+                            read_varint()
+
+                # Cost model was introduced with v12, so it is not
+                # possible in this legacy branch.
+
+        # ------------------------------------------------------------
+        # Main proto id
+        # ------------------------------------------------------------
+
+        main_proto = read_varint()
+
+        if main_proto >= proto_count:
+            raise ValueError(
+                f"Некорректный main proto id: "
+                f"{main_proto}/{proto_count}"
+            )
 
         if cursor != len(bytecode):
             raise ValueError(
