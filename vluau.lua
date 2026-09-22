@@ -1,4 +1,4 @@
---!optimize 1
+--!optimize 2
 --!native
 -- // Environment changes in the VM are not supposed to alter the behaviour of the VM so we localise globals beforehand
 print("=== LOADED V LUAU ===")
@@ -1715,9 +1715,6 @@ local function luau_load(module, env, luau_settings)
             coroutine_yield(LUA_GENERALIZED_TERMINATOR)
         end
 
-        generalized_iterators[loopInst] = coroutine_create(gen_iterator)
-    end
-
 					pc += inst.D
 				elseif op == 77 then --[[ JUMPXEQKNIL ]]
 					local kn = inst.KN
@@ -1866,7 +1863,7 @@ local function luau_load(module, env, luau_settings)
 						0
 					)
 				end
-
+			end
 			for i, uv in open_upvalues do
 				uv.value = uv.store[uv.index]
 				uv.store = uv
