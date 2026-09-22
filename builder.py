@@ -1245,5 +1245,3 @@ async def compilator(
         f"*исходный код*\n```lua\n{code}\n```\n"
         f"*скомпилированный код ({mode})*\n```text\n{output}\n```"
     )
-
-client.run("MTU1MDk0NzE5NDU5MTUxODg0MQ.GdmsaD.958bp6wDBsgJRbP1giP80e6N1k6QGw3NL9Xmpk")
